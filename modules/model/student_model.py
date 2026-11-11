@@ -11,11 +11,12 @@ class StudentModel(DualInputNet):
     """Student inference model whose forward API accepts only an image stack.
 
     The model keeps the efficient per-pixel branch / light-calibration options
-    from :class:`model_fast.DualInputNet`, but callers configure mask, image
-    counts, resolutions and optional light directions through
-    :meth:`set_inference_context` before calling ``forward(img)``.  No shading
-    tensor is accepted; if a light-weighted encoder is enabled, the image stack
-    itself is used as the photometric input.
+    from :class:`model_fast.DualInputNet`.  Constructor defaults match the
+    released ``model.pt`` checkpoint (light calibration on, per-pixel branch
+    width 64).  Callers configure mask, image counts, resolutions and optional
+    light directions through :meth:`set_inference_context` before calling
+    ``forward(img)``.  No shading tensor is accepted; if a light-weighted
+    encoder is enabled, the image stack itself is used as the photometric input.
     """
 
     def __init__(
@@ -24,9 +25,26 @@ class StudentModel(DualInputNet):
         device,
         canonical_resolution=128,
         decoder_resolution=256,
+        use_light_calib_model=True,
+        use_per_pixel_branch=True,
+        pp_out_ch=64,
+        light_calib_base=64,
+        light_calib_work_res=256,
         **kwargs,
     ):
-        super().__init__(pixel_samples=pixel_samples, device=device, **kwargs)
+        # Defaults match ``model.pt``: 7-channel SG encoder (stem in_chans=7),
+        # LightCalibNet base 64, and a per-pixel branch whose token width makes
+        # the decoder input 256 + 3 + 64 = 323.
+        super().__init__(
+            pixel_samples=pixel_samples,
+            device=device,
+            use_light_calib_model=use_light_calib_model,
+            use_per_pixel_branch=use_per_pixel_branch,
+            pp_out_ch=pp_out_ch,
+            light_calib_base=light_calib_base,
+            light_calib_work_res=light_calib_work_res,
+            **kwargs,
+        )
         self.default_canonical_resolution = int(canonical_resolution)
         self.default_decoder_resolution = int(decoder_resolution)
         self._mask = None
@@ -81,7 +99,6 @@ class StudentModel(DualInputNet):
             decoder,
             useShading=use_shading_path,
             light_param=light_param,
-            return_intermediate=False,
         )
         return normal
 

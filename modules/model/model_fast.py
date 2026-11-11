@@ -1,43 +1,4 @@
-"""
-Fast / efficient drop-in replacement for ``model.DualInputNet``.
-
-This module preserves the *exact* public interface of
-``modules.model.model.DualInputNet`` (constructor signature, ``forward``,
-``test``, ``load_pretrained_encoders``, freeze helpers, return shapes) but
-swaps the costly O(N^2) hand-rolled multi-head attention used inside
-``modules.model.transformer`` for ``F.scaled_dot_product_attention`` (SDPA).
-
-The low-level SDPA attention primitives (``MultiHeadAttentionBlock``, ``SAB``,
-``PMA``, ``CommunicationBlock``, ``AggregationBlock``) live in
-``transformer_sdpa.py``; this file contains only the higher-level model
-components and the top-level ``DualInputNetFast`` class.
-
-Why this is faster
-------------------
-* SDPA dispatches to fused FlashAttention / memory-efficient kernels on
-  CUDA when available.
-* The hand-rolled implementation in ``transformer.MultiHeadSelfAttentionBlock``
-  performs explicit ``torch.cat(... .split(...))`` head-splitting, manual
-  ``softmax`` and ``bmm`` calls, and an extra ``Dropout`` on the attention
-  matrix; SDPA does all of this in a single fused kernel.
-Weight compatibility
---------------------
-All sub-module attribute names are kept identical to the originals
-(``fc_q``, ``fc_k``, ``fc_v``, ``ln0``, ``ln1``, ``fc_o1``, ``fc_o2``,
-``enc``, ``dec``, ``mab``, ``S``, ``comm``, ``aggregation``,
-``prediction_normal``, ``image_encoder``, ``glc_upsample``,
-``glc_aggregation``, ``regressor``).  Existing
-checkpoints saved by ``DualInputNet`` therefore load via
-``load_pretrained_encoders`` (with ``strict=False``); any legacy
-``window_regressor.*`` / ``window_residual_refiner.*`` entries written
-during the (now removed) window-attention experiment are silently
-skipped.
-
-Numerically the new attention is mathematically equivalent to the
-original "Normal" attention path (we explicitly pre-scale Q so SDPA's
-``1/sqrt(d_head)`` scale combines to the same ``1/sqrt(dim_V)`` that the
-original code uses).  Fine-tuning is therefore expected to be unaffected.
-"""
+"""SDPA-backed photometric stereo network."""
 
 import math
 from contextlib import contextmanager
@@ -59,8 +20,6 @@ from .photometric_prior import build_light_weighted_feature
 SHALLOW_DISTILLATION_MODULE_PATHS = {
     "pp_conv1": "image_encoder.per_pixel_branch.conv.0",
     "pp_conv2": "image_encoder.per_pixel_branch.conv.2",
-    # ConvNeXt is called for both the resized image and the tiled image.
-    # ShallowFeatureHooks keeps the first activation, i.e. the resized path.
     "convnext_stem": (
         "image_encoder.backbone.backbone.0.downsample_layers.0"
     ),
@@ -69,7 +28,7 @@ SHALLOW_DISTILLATION_MODULE_PATHS = {
 
 
 class ShallowFeatureHooks:
-    """Capture named shallow activations without changing model forward APIs."""
+    """Capture named shallow activations without changing the forward API."""
 
     def __init__(self, model, layer_names):
         self.features = {}
@@ -97,7 +56,7 @@ class ShallowFeatureHooks:
 
     def _make_hook(self, layer_name):
         def hook(_module, _inputs, output):
-            # ConvNeXt modules run twice; retain the resized-image activation.
+            # ConvNeXt runs twice per forward; keep the resized-image activation.
             if self.enabled and layer_name not in self.features:
                 self.features[layer_name] = output
 
@@ -123,18 +82,11 @@ class ShallowFeatureHooks:
         self._handles.clear()
 
 
-# ---------------------------------------------------------------------------
-# Image feature extractor / fusion / encoder
-# ---------------------------------------------------------------------------
-
 class ImageFeatureExtractor(nn.Module):
-    """Same as ``model.ImageFeatureExtractor`` -- ConvNeXt backbone."""
-
     def __init__(self, input_nc):
         super().__init__()
         self.out_channels = (96, 192, 384, 768)
-        # Wrap in Sequential so the ``backbone.0.*`` parameter prefix matches
-        # the original ``ImageFeatureExtractor`` (which uses ``nn.Sequential``).
+        # Sequential keeps the checkpoint prefix ``backbone.0.*``.
         self.backbone = nn.Sequential(convnext.ConvNeXt(in_chans=input_nc))
 
     def forward(self, x):
@@ -142,19 +94,6 @@ class ImageFeatureExtractor(nn.Module):
 
 
 class ImageFeatureFusion(nn.Module):
-    """Vectorised replacement for ``model.ImageFeatureFusion``.
-
-    Differences vs. the original:
-
-    * Self-attention inside ``CommunicationBlock`` uses SDPA.
-    * The per-batch Python ``for b in range(batch_size)`` loop is
-      eliminated *when all batch elements share the same number of
-      images* (the common bucketed-training case): we then run the
-      communication block exactly once on a rearranged tensor.
-    * For variable image counts we fall back to the original per-batch
-      loop -- still correct, just less vectorised.
-    """
-
     def __init__(self, in_channels):
         super().__init__()
         self.fusion = uper.UPerHead(in_channels=in_channels)
@@ -172,11 +111,9 @@ class ImageFeatureFusion(nn.Module):
                         dim_feedforward=in_channels[i],
                     )
                 )
-        # Use ModuleList so we can index numerically; original uses
-        # Sequential (also indexable). Naming "comm" matches the original.
         self.comm = nn.ModuleList(attn)
 
-    def forward(self, glc, nImgArray, return_attention=False):
+    def forward(self, glc, nImgArray):
         batch_size = len(nImgArray)
         n_list = [int(n) for n in (nImgArray.tolist() if torch.is_tensor(nImgArray) else nImgArray)]
         sum_nimg = sum(n_list)
@@ -188,20 +125,13 @@ class ImageFeatureFusion(nn.Module):
             if self.num_comm_enc[k] > 0:
                 in_fuse = glc[k]
                 _, C, H, W = in_fuse.shape
-                # ((K+1)*sum_nimg, C, H, W) -> (K+1, sum_nimg, C, H, W)
                 in_fuse = in_fuse.reshape(-1, sum_nimg, C, H, W).permute(0, 3, 4, 1, 2)
                 K_plus = in_fuse.shape[0]
-                # -> (K_plus*H*W, sum_nimg, C)
                 in_fuse = in_fuse.reshape(K_plus * H * W, sum_nimg, C)
                 M = K_plus * H * W
 
                 if same_n:
                     n_b = n_list[0]
-                    # Reinterpret sum_nimg = batch_size * n_b and run the comm
-                    # block once over (batch_size * M, n_b, C).  The original
-                    # code processes each batch element separately because
-                    # different batch elements may have different ``n_b`` --
-                    # when they don't, this is exactly equivalent.
                     feats = (
                         in_fuse.view(M, batch_size, n_b, C)
                         .transpose(0, 1)
@@ -214,8 +144,6 @@ class ImageFeatureFusion(nn.Module):
                         .reshape(M, sum_nimg, C)
                     )
                 else:
-                    # Variable image counts -- fall back to per-batch loop
-                    # (matches original behaviour exactly).
                     feats_list = []
                     ids = 0
                     for b in range(batch_size):
@@ -226,7 +154,6 @@ class ImageFeatureFusion(nn.Module):
                         ids += n_b
                     feats = torch.cat(feats_list, dim=1)
 
-                # Restore spatial layout: (M, sum_nimg, C) -> ((K+1)*sum_nimg, C, H, W)
                 feats = feats.reshape(K_plus, H * W, sum_nimg, C).permute(0, 2, 3, 1)
                 feats = feats.reshape(K_plus * sum_nimg, C, H, W)
                 out_fuse.append(feats)
@@ -238,20 +165,7 @@ class ImageFeatureFusion(nn.Module):
 
 
 class PerPixelBranch(nn.Module):
-    """Lightweight per-pixel feature extractor that keeps the full ``H x W``
-    resolution (no downsampling).
-
-    Complementary to the ConvNeXt ``ImageFeatureExtractor`` backbone:
-      * backbone   -> abstract / global features (4x ~ 32x downsampled)
-      * this branch -> pixel-level photometric details (zero downsampling)
-
-    Design notes (see ``fix1_per_pixel_branch_dev_doc.md``):
-      * Shallow (3 layers) and moderately wide, to avoid duplicating
-        backbone capacity.
-      * 3x3 convolutions naturally overlap, so no grid artefacts.
-      * Input is the same ``[N, input_nc, H, W]`` tensor that feeds the
-        backbone, so the encoder dataloader output is reused as-is.
-    """
+    """Full-resolution features, with no spatial downsampling."""
 
     def __init__(self, in_ch=4, out_ch=64, mid_ch=32):
         super().__init__()
@@ -265,13 +179,10 @@ class PerPixelBranch(nn.Module):
         )
 
     def forward(self, x):
-        # x: [N, in_ch, H, W] -> [N, out_ch, H, W] (resolution preserved).
         return self.conv(x)
 
 
 class ScaleInvariantSpatialLightImageEncoder(nn.Module):
-    """Same forward logic as the original encoder, fast fusion underneath."""
-
     def __init__(
         self,
         input_nc,
@@ -284,8 +195,6 @@ class ScaleInvariantSpatialLightImageEncoder(nn.Module):
         self.fusion = ImageFeatureFusion(self.backbone.out_channels)
         self.feat_dim = 256
 
-        # [fix1] Per-pixel branch: parallel zero-downsampling conv stack that
-        # preserves pixel-level photometric detail lost in the ConvNeXt stem.
         self.use_per_pixel_branch = use_per_pixel_branch
         self.pp_out_ch = pp_out_ch if use_per_pixel_branch else 0
         self.pp_input_nc = pp_input_nc if pp_input_nc is not None else input_nc
@@ -296,14 +205,7 @@ class ScaleInvariantSpatialLightImageEncoder(nn.Module):
         else:
             self.per_pixel_branch = None
 
-    def forward(
-        self,
-        x,
-        nImgArray,
-        canonical_resolution,
-        return_intermediate=False,
-        pp_input=None,
-    ):
+    def forward(self, x, nImgArray, canonical_resolution, pp_input=None):
         N, C, H, W = x.shape
         canon = int(canonical_resolution)
         if H % canon != 0 or W % canon != 0:
@@ -313,27 +215,19 @@ class ScaleInvariantSpatialLightImageEncoder(nn.Module):
         mosaic_scale = H // canon
         K = mosaic_scale * mosaic_scale
 
-        # (1a) resize x to (Hc, Wc)
         x_resized = F.interpolate(x, size=(canon, canon), mode="bilinear", align_corners=True)
-
-        # (1b) decompose x into K x K of (Hc, Wc) non-overlapped blocks
         x_grid = divide_tensor_spatial(x, block_size=canon, method="tile_stride")
         x_grid = x_grid.permute(1, 0, 2, 3, 4).reshape(-1, C, canon, canon)
 
-        # (2a) feature extraction at canonical resolution
-        back_feats = self.backbone(x_resized)
-        f_resized = self.fusion(back_feats, nImgArray)
+        f_resized = self.fusion(self.backbone(x_resized), nImgArray)
         f_resized = f_resized.reshape(1, N, self.feat_dim, canon // 4 * canon // 4)
         del x_resized
 
-        # (2b) feature extraction over tiles
-        grid_back_feats = self.backbone(x_grid)
-        gf = self.fusion(grid_back_feats, nImgArray)
+        gf = self.fusion(self.backbone(x_grid), nImgArray)
         gf = gf.reshape(K, N, gf.shape[1], canon // 4, canon // 4)
         glc_grid = merge_tensor_spatial(gf, method="tile_stride")
         del x_grid
 
-        # (3) upsample
         glc_resized = F.interpolate(
             f_resized.reshape(N, self.feat_dim, canon // 4, canon // 4),
             size=(H // 4, W // 4),
@@ -344,29 +238,16 @@ class ScaleInvariantSpatialLightImageEncoder(nn.Module):
 
         glc = glc_resized + glc_grid
 
-        # [fix1] Per-pixel branch operates on the full-resolution input ``x``
-        # (same tensor that feeds the backbone), so each output spatial
-        # location aligns 1:1 with an input pixel.  Returns ``None`` when
-        # disabled so downstream consumers can branch on it cheaply.
         pp_feat = None
         if self.use_per_pixel_branch:
             if pp_input is None:
                 pp_input = x
             pp_feat = self.per_pixel_branch(pp_input)
 
-        if return_intermediate:
-            back_feats = {"global": back_feats, "grid": grid_back_feats}
-            return glc, back_feats, pp_feat
         return glc, pp_feat
 
 
-# ---------------------------------------------------------------------------
-# Per-pixel heads (drop-in replacements; weight names match originals)
-# ---------------------------------------------------------------------------
-
 class GLC_Upsample(nn.Module):
-    """Replacement for ``model.GLC_Upsample``."""
-
     def __init__(self, input_nc, num_enc_sab=1, dim_hidden=256, dim_feedforward=1024):
         super().__init__()
         self.comm = CommunicationBlock(
@@ -382,8 +263,6 @@ class GLC_Upsample(nn.Module):
 
 
 class GLC_Aggregation(nn.Module):
-    """Replacement for ``model.GLC_Aggregation``."""
-
     def __init__(
         self,
         input_nc,
@@ -408,8 +287,6 @@ class GLC_Aggregation(nn.Module):
 
 
 class PredictionHead(nn.Module):
-    """Same as ``model.PredictionHead``."""
-
     def __init__(self, dim_input, dim_output):
         super().__init__()
         modules_regression = [
@@ -424,14 +301,6 @@ class PredictionHead(nn.Module):
 
 
 class Regressor(nn.Module):
-    """Replacement for ``model.Regressor``.
-
-    Uses a ``CommunicationBlock`` (SDPA-backed) for the per-pixel
-    self-attention -- this is the dominant cost in the original network
-    because the sequence length here equals the number of sampled pixels
-    in a chunk (often thousands).
-    """
-
     def __init__(self, input_nc, num_enc_sab=1, dim_feedforward=256):
         super().__init__()
         self.comm = CommunicationBlock(
@@ -444,9 +313,7 @@ class Regressor(nn.Module):
         self.prediction_normal = PredictionHead(input_nc, 3)
 
     def forward(self, x, num_sample_set, n_imgs=None):
-        # ``x`` is (M, N_imgs, C); ``num_sample_set`` is the per-chunk sample
-        # count.  We attend across the M dim grouped into windows of size
-        # ``num_sample_set`` -- identical semantics to the original.
+        # Attend within chunks of ``num_sample_set`` pixels. ``x`` is (M, C).
         if x.shape[0] % num_sample_set == 0:
             x_ = x.reshape(-1, num_sample_set, x.shape[1])
             x_ = self.comm(x_)
@@ -463,20 +330,8 @@ class Regressor(nn.Module):
         return self.prediction_normal(x)
 
 
-
 def mean_valid_shots(x, nImgArray):
-    """Average valid shots along the final ``Nmax`` shot dimension.
-
-    Args:
-        x: Tensor with shape ``[B, C, H, W, Nmax]``.
-        nImgArray: Valid-shot counts with shape ``[B]``.
-
-    Returns:
-        Tensor with shape ``[B, C, H, W]``.
-
-    Only shots where ``shot_id < nImgArray[b]`` contribute to each sample's
-    mean; padded shots are masked out.
-    """
+    """Average valid shots. ``x`` is ``[B, C, H, W, Nmax]``; padded shots are masked."""
     B, _, _, _, Nmax = x.shape
     n_img = nImgArray.to(x.device)
     counts = n_img.to(x.dtype).clamp_min(1).view(B, 1, 1, 1)
@@ -486,13 +341,7 @@ def mean_valid_shots(x, nImgArray):
 
 
 class LightCalibNet(nn.Module):
-    """Per-shot, per-channel global light-direction estimator.
-
-    Input ``I`` is a multispectral RGB stack with shape
-    ``[B, 3, H, W, Nmax]``; ``nImgArray`` contains valid-shot counts.  The
-    output is ``l_hat`` with shape ``[B, Nmax, 3, 3]`` and unit-norm xyz
-    directions for each RGB channel.
-    """
+    """Unit light direction per shot and RGB channel, shape ``[B, Nmax, 3, 3]``."""
 
     def __init__(self, in_ch: int = 3, base: int = 64, work_res: int = 256):
         super().__init__()
@@ -523,26 +372,8 @@ class LightCalibNet(nn.Module):
         return F.normalize(l, dim=-1, eps=1e-6)
 
 
-
-# ---------------------------------------------------------------------------
-# Top-level network
-# ---------------------------------------------------------------------------
-
 class DualInputNet(nn.Module):
-    """Drop-in faster replacement for ``model.DualInputNet``.
-
-    The constructor remains backward-compatible with ``DualInputNet`` and the
-    ``forward`` signature and return-value shapes are unchanged -- swap the
-    import and existing training pipelines work unchanged.  (The legacy inference-only
-    ``test`` method has been removed; it was never used by any caller of
-    this fast variant.)
-
-    Light input is selected with two mutually exclusive switches:
-    ``use_light_calib_model`` predicts directions inside ``forward`` with
-    ``LightCalibNet``; ``use_light`` consumes real directions passed as
-    ``light_param``.  If both are enabled, ``use_light_calib_model`` takes
-    precedence.
-    """
+    """``use_light_calib_model`` predicts directions; ``use_light`` reads ``light_param``. Calibration wins if both are set."""
 
     def __init__(self, pixel_samples, device,
                  use_light_calib_model=False,
@@ -556,14 +387,7 @@ class DualInputNet(nn.Module):
         self.device = device
         self.pixel_samples = pixel_samples
         self.glc_smoothing = True
-        # [Teacher-S1'] Light-weighted input feature G = Σ_c S_c * l_c.
-        # ``use_light_calib_model`` predicts lights with LightCalibNet inside
-        # forward(); ``use_light`` consumes real light directions supplied to
-        # forward().  Both light paths use the SG encoder input.  Without a
-        # light path the encoder falls back to the ordinary 4-channel input.
         self.use_light_calib_model = bool(use_light_calib_model)
-        # Mutually exclusive light sources: LightCalibNet predicts the active
-        # directions itself, so it takes precedence if both switches are on.
         self.use_light = bool(use_light) and not self.use_light_calib_model
         self.uses_light_input = self.use_light_calib_model or self.use_light
         self.light_input_mode = "SG"
@@ -571,16 +395,13 @@ class DualInputNet(nn.Module):
         if self.use_light_calib_model:
             self.light_calib = LightCalibNet(
                 in_ch=3, base=light_calib_base, work_res=light_calib_work_res
-            )
-        # Encoder input channels: 7 for SG (S+G+M), 4 otherwise (with M).
+            ).to(self.device)
+        # 7 channels (shading, light-weighted feature, mask) or 4 (RGB, mask).
         if self.uses_light_input:
             self.input_dim = 7
         else:
             self.input_dim = 4
 
-        # [fix1] Per-pixel branch switch; the branch output ``pp_out_ch`` is
-        # concatenated into the decoder chunk token alongside ``o_ids`` and
-        # ``glc_ids`` (see ``fix1_per_pixel_branch_dev_doc.md``).
         self.use_per_pixel_branch = use_per_pixel_branch
         self.pp_out_ch = pp_out_ch if use_per_pixel_branch else 0
         self.image_encoder = ScaleInvariantSpatialLightImageEncoder(
@@ -591,8 +412,6 @@ class DualInputNet(nn.Module):
         ).to(self.device)
 
         self.rgb_dim = 3
-        # [fix1] Per-pixel branch features are concatenated into the token
-        # decoder, so ``upsample_in`` grows by ``pp_out_ch`` when enabled.
         upsample_in = 256 + self.rgb_dim + self.pp_out_ch
         self.glc_upsample = GLC_Upsample(
             upsample_in, num_enc_sab=1, dim_hidden=256, dim_feedforward=1024
@@ -607,12 +426,8 @@ class DualInputNet(nn.Module):
             384, num_enc_sab=1, dim_feedforward=1024
         ).to(self.device)
 
-        # Cache for the Gaussian smoothing filter (channels, kernel_size).
         self._smoothing_cache = {}
 
-    # ------------------------------------------------------------------
-    # Freeze helpers (same names + signatures as DualInputNet)
-    # ------------------------------------------------------------------
     def freeze_image_encoder(self, freeze=True):
         for param in self.image_encoder.parameters():
             param.requires_grad = not freeze
@@ -643,22 +458,10 @@ class DualInputNet(nn.Module):
         mode_change(self.glc_aggregation, False)
         mode_change(self.regressor, False)
 
-    # ------------------------------------------------------------------
-    # Pretrained weight loading -- mirrors ``DualInputNet.load_pretrained_encoders``
-    # ------------------------------------------------------------------
     def load_pretrained_encoders(self, state_dict):
-        """Load weights from a ``DualInputNet`` (or ``DualInputNetFast``) checkpoint.
+        """Load encoder, upsample, aggregation and regressor weights.
 
-        Handles two layouts:
-            1. Single-encoder checkpoints with ``image_encoder.*`` keys.
-            2. Old dual-encoder checkpoints with ``shading_encoder.*`` (used as
-               fallback when no ``image_encoder.*`` keys are present).
-
-        Any legacy ``refiner.*`` / ``dense_decoder.*`` keys from older
-        checkpoints are silently skipped (those modules have been removed).
-
-        Loading is non-strict: extra keys (e.g. ``shading_encoder.*``) and
-        any minor shape-incompatible entries are tolerated and reported.
+        Uses ``shading_encoder.*`` when ``image_encoder.*`` is absent.
         """
         if any(k.startswith("module.") for k in state_dict.keys()):
             state = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
@@ -680,18 +483,7 @@ class DualInputNet(nn.Module):
                 print("[Pretrain] No image_encoder keys found; falling back to shading_encoder keys")
 
         if enc_state:
-            # [Teacher-S1'-local] When SG light input is enabled the encoder
-            # input dim grows from 4 (S+M / G+M) to 7 (S+G+M).  The ConvNeXt
-            # stem ``backbone.0.downsample_layers.0.0.weight`` has shape
-            # ``[96, in_chans, 4, 4]`` -- its ``in_chans`` axis mismatches the
-            # checkpoint, and PyTorch's ``load_state_dict(strict=False)`` does
-            # NOT forgive size mismatches (it forgives only missing/unexpected
-            # keys); we therefore reshape the stem-conv weight ourselves
-            # before loading.  Behaviour matches the decoder-side handling
-            # below: extra input channels get a small initialization (so the network
-            # initially behaves as if the new channels were near-zero, but
-            # is not stuck in a symmetric all-zero regime); shrinking
-            # truncates the leading channels.  See ``S1_local_dev_doc.md`` §7.
+            # strict=False ignores missing keys, not shape mismatches.
             stem_key = "backbone.backbone.0.downsample_layers.0.0.weight"
             cur_stem = dict(self.image_encoder.named_parameters()).get(stem_key)
             if stem_key in enc_state and cur_stem is not None:
@@ -758,36 +550,14 @@ class DualInputNet(nn.Module):
             ("regressor.", self.regressor, None),
         ):
             if mod is None:
-                # Module disabled; report any keys that we would otherwise
-                # have consumed and move on.
                 sub = {k for k in state if k.startswith(prefix)}
                 if sub:
                     print(f"[Pretrain] {prefix[:-1]} disabled; skipping {len(sub)} checkpoint keys")
                 continue
             sub = {k.replace(prefix, "", 1): v for k, v in state.items() if k.startswith(prefix)}
             if sub:
-                # When loading checkpoints whose decoder token input dim
-                # differs from the current configuration (for example because
-                # the legacy fix1 variant injected ``pp_out_ch`` extra channels into the
-                # first MAB), every parameter whose shape depends on
-                # ``dim_in`` of that first MAB has to be reshaped before
-                # load_state_dict, otherwise PyTorch raises a RuntimeError
-                # (``strict=False`` only forgives missing/unexpected keys,
-                # not size mismatches):
-                #   * fc_q/fc_k/fc_v.weight : Linear(dim_in -> dim_hidden),
-                #     extra input columns use small initialization so the rest of the
-                #     layer keeps its learned semantics (zero-init can trap
-                #     symmetries).
-                #   * ln0.weight / ln0.bias : LayerNorm(dim_in), extra
-                #     dimensions are initialised to the LayerNorm defaults
-                #     (weight=1, bias=0) so the new channels pass through
-                #     unchanged at load time.
+                # First attention block input width may differ from the checkpoint.
                 if first_linear_root is not None:
-                    # (sub_name, axis_for_dim_in, pad_init_fn)
-                    # - axis_for_dim_in: which tensor axis carries dim_in.
-                    # - pad_init_fn(tensor_slice): fills the new slice in
-                    #   place.  Each function takes the new (uninitialised)
-                    #   slice tensor that needs to be populated.
                     expand_specs = (
                         (
                             "fc_q.weight", 1,
@@ -801,7 +571,7 @@ class DualInputNet(nn.Module):
                             "fc_v.weight", 1,
                             lambda t: torch.nn.init.normal_(t, mean=0.0, std=1e-3),
                         ),
-                        # LayerNorm(dim_in) defaults: weight=1, bias=0.
+                        # LayerNorm defaults: weight=1, bias=0.
                         ("ln0.weight", 0, lambda t: t.fill_(1.0)),
                         ("ln0.bias", 0, lambda t: t.fill_(0.0)),
                     )
@@ -847,8 +617,6 @@ class DualInputNet(nn.Module):
                 if msg.unexpected_keys:
                     print(f"[Pretrain] {prefix[:-1]} unexpected keys: {len(msg.unexpected_keys)}")
 
-        # Silently swallow any legacy ``refiner.*`` / ``dense_decoder.*`` keys
-        # from older checkpoints; the modules have been removed.
         legacy_consumed = {"refiner.", "dense_decoder."}
         legacy_keys = [k for k in state if any(k.startswith(p) for p in legacy_consumed)]
         if legacy_keys:
@@ -867,9 +635,6 @@ class DualInputNet(nn.Module):
         if skipped:
             print(f"[Pretrain] Skipped {len(skipped)} unrecognised keys: {skipped[:5]}...")
 
-    # ------------------------------------------------------------------
-    # Helper: cached Gaussian filter
-    # ------------------------------------------------------------------
     def _get_smoothing(self, channels, kernel_size, sigma, device):
         cache_key = (channels, kernel_size)
         if cache_key not in self._smoothing_cache:
@@ -878,9 +643,6 @@ class DualInputNet(nn.Module):
             ).to(device)
         return self._smoothing_cache[cache_key]
 
-    # ------------------------------------------------------------------
-    # Training-time forward (matches ``DualInputNet.forward``)
-    # ------------------------------------------------------------------
     def forward(
         self,
         I,
@@ -891,7 +653,6 @@ class DualInputNet(nn.Module):
         decoder_resolution,
         useShading=False,
         light_param=None,
-        return_intermediate=False,
     ):
         decoder_resolution = int(decoder_resolution[0, 0].item())
         canonical_resolution = int(canonical_resolution[0, 0].item())
@@ -904,13 +665,8 @@ class DualInputNet(nn.Module):
         M_enc = M.repeat(1, Nmax, 1, 1).reshape(B * Nmax, 1, H, W)
         M_dec = F.interpolate(M, size=decoder_imgsize, mode="nearest")
         nout = torch.zeros(B, H_dec * W_dec, 3, device=self.device)
-        upglc_dim = 256
-        x_dim = 384
 
-        # Pre-compute valid pixel indices for every batch element and
-        # randomly permute them so the chunk-level set attention sees
-        # spatially uncorrelated pixels (the original "random attention"
-        # path that pre-dates the window-attention experiment).
+        # Shuffle valid pixels so each attention chunk is not a spatial block.
         M_flat = M_dec.reshape(B, H_dec * W_dec)
         all_ids = [torch.nonzero(M_flat[b] > 0, as_tuple=True)[0] for b in range(B)]
         n_valid_counts = [len(ids_b) for ids_b in all_ids]
@@ -924,16 +680,8 @@ class DualInputNet(nn.Module):
                 for ids_b in all_ids
             ]
 
-        # Select input data based on useShading flag (single unified path).
-        # ``input_data`` (3-channel) is also used for the per-pixel decoder
-        # observation ``o_ids``; the encoder-side input may differ in the
-        # Teacher-S1' light-weighted variants below.
         input_data = S if (useShading and S is not None) else I
 
-        # [Teacher-S1'] Build the encoder input core.
-        #   light-calib -> [S, G(l_hat), M] with l_hat predicted from I
-        #   use-light   -> [S, G(L), M] with L supplied by the caller
-        #   no-light    -> [input_data, M]
         active_light_param = None
         if self.use_light_calib_model:
             active_light_param = self.light_calib(I, nImgArray)
@@ -950,8 +698,8 @@ class DualInputNet(nn.Module):
             )
             G = build_light_weighted_feature(
                 S, active_light_param.to(self.device), nImgArray=nImgArray
-            )  # [B, 3, H, W, Nmax]
-            enc_core = torch.cat([S, G], dim=1)  # [B, 6, H, W, Nmax]
+            )
+            enc_core = torch.cat([S, G], dim=1)
         else:
             enc_core = input_data
 
@@ -959,34 +707,14 @@ class DualInputNet(nn.Module):
         enc_input = enc_core.permute(0, 4, 1, 2, 3).reshape(B * Nmax, enc_core_C, H, W)
         data = torch.cat([enc_input * M_enc, M_enc], dim=1)
         data = data[img_index, :, :, :]
-        if return_intermediate:
-            glc, backfeats, pp_feat = self.image_encoder(
-                data, nImgArray, canonical_resolution, return_intermediate=True,
-            )
-        else:
-            glc, pp_feat = self.image_encoder(
-                data, nImgArray, canonical_resolution, return_intermediate=False,
-            )
-        # [fix1] ``pp_feat`` is ``None`` when the per-pixel branch is
-        # disabled.  When enabled it has shape ``[sum_nimg, pp_out_ch, H, W]``
-        # at the original input resolution (no downsampling).
-        # Always apply the Gaussian smoothing of the global-local feature map
-        # (Teacher-S1' design: ``smoothing`` is no longer toggleable from the
-        # forward signature; ``self.glc_smoothing`` remains the single flag).
+        glc, pp_feat = self.image_encoder(data, nImgArray, canonical_resolution)
         if self.glc_smoothing:
             f_scale = decoder_resolution // canonical_resolution
             kernel_size = 10 * f_scale + 1
             smoothing_op = self._get_smoothing(glc.shape[1], kernel_size, 1, glc.device)
             glc = smoothing_op(glc)
 
-        if return_intermediate:
-            mid_results = {"glc": glc, "backfeats": backfeats}
-            if self.uses_light_input:
-                mid_results["input_mode"] = self.light_input_mode
-                mid_results["light_param"] = active_light_param
-            total_upglc = torch.zeros(B, H_dec * W_dec, Nmax, upglc_dim, device=self.device)
-            total_aggx = torch.zeros(B, H_dec * W_dec, x_dim, device=self.device)
-        p = 0  # cumulative image offset into the flat glc feature map
+        p = 0
         for b in range(B):
             batch_data = input_data[b].permute(3, 0, 1, 2).contiguous()
             valid_mask = img_index[b * Nmax:(b + 1) * Nmax]
@@ -996,7 +724,6 @@ class DualInputNet(nn.Module):
             if n_valid <= 0 or batch_data_valid.shape[0] == 0:
                 continue
             target_glc = slice(p, p + n_valid)
-            target_local = slice(0, n_valid)
             p += n_valid
 
             ids = all_ids[b]
@@ -1011,9 +738,6 @@ class DualInputNet(nn.Module):
             o_ = data_dec.reshape(n_valid, C, H_dec * W_dec).permute(2, 0, 1)
             glc_batch = glc[target_glc]
 
-            # [fix1] Per-pixel branch features at the original input
-            # resolution.  Sliced per batch element so each chunk samples
-            # the matching shots; ``None`` when the branch is disabled.
             pp_batch = pp_feat[target_glc] if pp_feat is not None else None
 
             hw_tensor = torch.tensor((H_dec, W_dec), device=ids.device, dtype=torch.long)
@@ -1024,10 +748,6 @@ class DualInputNet(nn.Module):
                 glc_ids = F.grid_sample(glc_batch, coords, mode="bilinear", align_corners=False)
                 glc_ids = glc_ids.reshape(n_valid, -1, len(ids_chunk)).permute(2, 0, 1)
 
-                # [fix1] Sample the per-pixel branch features at the same
-                # decoder coordinates.  ``coords`` is normalised to [-1,1]
-                # so grid_sample adapts to the full input resolution of
-                # ``pp_batch`` automatically.
                 pp_ids = None
                 if pp_batch is not None:
                     pp_ids = F.grid_sample(
@@ -1044,18 +764,8 @@ class DualInputNet(nn.Module):
                 upglc_ids = self.glc_upsample(x)
                 x = torch.cat([o_ids, upglc_ids] + extra_feats, dim=2)
                 x = self.glc_aggregation(x)
-
-                if return_intermediate:
-                    total_upglc[b, ids_chunk, target_local, :] = upglc_ids
-                    total_aggx[b, ids_chunk, :] = x
                 x_n = self.regressor(x, len(ids_chunk), n_imgs=n_valid)
                 nout[b, ids_chunk, :] = x_n
 
         nout = nout.permute(0, 2, 1).reshape(B, 3, H_dec, W_dec)
-        nout = F.normalize(nout, dim=1, eps=1e-6)
-
-        if return_intermediate:
-            mid_results["upglc"] = total_upglc
-            mid_results["aggx"] = total_aggx
-            return mid_results, nout
-        return nout
+        return F.normalize(nout, dim=1, eps=1e-6)
